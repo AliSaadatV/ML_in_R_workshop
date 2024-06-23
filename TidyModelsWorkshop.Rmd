@@ -330,12 +330,12 @@ final_fit %>%
 
 ```{r}
 # Plot ROC-AUC curve for knn_RandomForest
-xgb_auc <- final_fit %>%
+rf_auc <- final_fit %>%
   collect_predictions() %>% 
   roc_curve(judge, .pred_0) %>% 
   dplyr::mutate(model = "knn_RandomForest")
 
-xgb_auc %>% 
+rf_auc %>% 
   ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
   geom_path(lwd = 1.5, alpha = 0.8) +
   geom_abline(lty = 3) + 
@@ -394,7 +394,7 @@ final_tree %>%
 ```
 
 
-# 1.9.3 explain_tidymodels
+# 1.9.3 Extra: explain_tidymodels
 
 ```{r}
 
@@ -462,25 +462,3 @@ ggplot_pdp(pdp_did, `Disease Intersection Degree`)  +
        color = NULL)
 ```
 
-
-## Extra: Running a single recipe against a single model ()
-
-```{r}
-# We will now create the workflow, which combines the preprocessed data (recipe) with our defined ML model (engine).
-
-lr_workflow <- 
-  workflow() %>% 
-  add_model(xgboost_spec) %>% 
-  add_recipe(data_rec_mean)
-
-grid_results_impute <- 
-  lr_workflow %>% 
-  tune_grid(resamples = data_folds, # cross-fold validation groupings
-            grid = 50,
-            control = grid_ctrl,
-            metrics = all_metrics
-    )
-
-# Select best hyperparameters of best model
-best_results_parameters <- select_best(grid_results_impute, metric = "f_meas")
-```
