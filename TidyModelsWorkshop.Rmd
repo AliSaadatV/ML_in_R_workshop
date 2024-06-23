@@ -1,0 +1,486 @@
+---
+title: "TidyModelsWorkshop"
+author: "Simon Tang"
+date: "2024-05-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 0. Setup
+## 0.1 Import libraries and data
+
+```{r load_libraries}
+
+# if some of the following packages are missing for you, please use "install.packages()" to install it
+
+library(readxl) # for importing file
+library(tidymodels) # for ML
+library(rpart.plot) # For decision trees
+library(vip) # for variable importance plots
+library(naivebayes) # for naive bayes
+library(randomForest) # for random forest
+library(stringr) # for data formatting
+library(DALEXtra) # for explain_tidymodels
+tidymodels::tidymodels_prefer()
+```
+
+
+## 0.2 Clean Data
+
+```{r import_clean_data, include=FALSE}
+data <- read_excel("data.XLSX", sheet = "Sheet1")
+colnames(data) <- data[3,]
+data_clean <- data[-c(1:3),] # Remove the first three rows, which are just titles
+data_clean <- data_clean[,-c(1:2)] # Remove the first two columns, as they don't contribute anything
+data_clean[, 1:5] <- apply(data_clean[, 1:5], 2, as.numeric)
+```
+
+```{r define_parameters}
+chosen_metric <- "f_meas" # How will we assess the predictive power of our model? We could use accuracy, roc_auc, f_meas, mcc, sens, spec, bal_accuracy, but to account for the imbalanced distribution of synergistic and antagonistic drug combos, we will use f_meas.
+all_metrics <- metric_set(accuracy, roc_auc, f_meas, mcc, sens, spec, bal_accuracy)
+```
+
+```{r}
+# Check proportion of synergistic/antagonistic values. It is imbalanced, with more synergistic combos.
+data_clean %>%
+  dplyr::count(judge) %>%
+  dplyr::mutate(prop = n/sum(n))
+```
+
+
+## 1. Preprocessing
+## 1.1 Exploratory Data Analysis
+
+```{r}
+# What’s the distribution of output variable?
+
+# Rename the factors
+named_judge <- factor(data_clean$judge, levels = c(0, 1), labels = c("antagonistic", "synergistic"))
+# Create the bar plot
+ggplot(data_clean, aes(x = factor(named_judge))) +
+  geom_bar() +
+  geom_text(stat = 'count', aes(label = ..count..), vjust = -0.5) +
+  labs(title = "Count of Antagonistic and Synergistic Combinations",
+       x = "Judge",
+       y = "Count") +
+  theme_minimal()
+```
+
+```{r}
+# What’s the distribution of numerical features?
+par(mfrow = c(3,2))
+hist(data_clean$`Disease Intersection Degree`)
+hist(data_clean$`Adverse Drug Reaction Intersection Degree`)
+hist(data_clean$`The Similarity of Mode of Action`)
+hist(data_clean$`Biological Process Similarity`)
+hist(data_clean$`Separation Score`)
+```
+
+```{r}
+# What’s the correlation of numerical features?
+corrplot_input <- na.omit(subset(data_clean, select = -c(judge, Pubmed, DCDB)))
+
+# Calculate the correlation matrix
+corr_matrix <- cor(corrplot_input)
+
+# Create the correlation plot
+corrplot::corrplot(corr_matrix, method = "circle", tl.srt = 45, tl.cex = 0.7, type = "upper")
+
+```
+
+
+## 1.2 Data Splitting
+
+```{r}
+
+# Split data, let's keep 25% for the test.
+set.seed(123)
+splits <- initial_split(data_clean, prop = 0.75, strata = judge) # We stratify by judge as there is an imbalanced proportion of synergistic and antagonistic pairs. We want the test and the train to have the same proportion of both. 25% will go to test, and 75% to train.
+
+data_train <- training(splits)
+data_test  <- testing(splits)
+
+# How are the proportion of synergistic/antagonistic pairs in the train and test?
+# Pretty much the same. See tables below.
+
+data_train %>% 
+  dplyr::count(judge) %>% 
+  dplyr::mutate(proportion = n/sum(n))
+
+data_test %>% 
+  dplyr::count(judge) %>% 
+  dplyr::mutate(proportion = n/sum(n))
+
+```
+
+
+## 1.3 Build recipes
+
+``` {r}
+# We first build a recipe. A recipe tells the code what is the variable to predict, what are the predictor variables, and any other preprocessing/transformation that needs to be done to the data before it is built into a model.
+
+data_rec_mean <-
+  recipe(judge ~ ., data = data_clean) %>%
+  update_role(Pubmed, DCDB, new_role = "ID") %>% # Specify variables that are IDs, thus not predictors
+  step_zv(all_predictors()) %>% # remove zero or near zero variance features - none are removed
+  step_impute_mean(all_predictors()) %>% # Impute all missing values
+  step_YeoJohnson(all_predictors()) %>% # Use Yeo_Johnson to resolve skewness
+  step_normalize(all_predictors()) # Standardize: center and scale
+
+data_rec_knn <-
+  recipe(judge ~ ., data = data_clean) %>%
+  update_role(Pubmed, DCDB, new_role = "ID") %>%
+  step_zv(all_predictors()) %>% 
+  step_impute_knn(all_predictors(), neighbors = 5) %>% 
+  step_YeoJohnson(all_predictors()) %>% 
+  step_normalize(all_predictors()) 
+```
+
+
+## 1.4 Build Models
+
+```{r}
+
+# Define model to run on recipe data. Here, we will do xgboost. This is saved under the model 'boost_tree', see below.
+
+show_engines("boost_tree")
+
+# Thus, to define our model, we must call the boost_tree model, then the specific type/engine (xgboost) and then what type of prediction (as we are predicting a category, we will choose classification).
+
+xgboost_spec <-
+  boost_tree(mtry = tune(),
+             trees = tune(),
+             min_n = tune(),
+             tree_depth = tune(),
+             learn_rate = tune(),
+             loss_reduction = tune(),
+             sample_size = tune()
+             ) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+# Note above that we are tuning all the settings pertaining to the model selected in order to find the best combination of hyperparameters to make the best predictions. Think of tune() here as a placeholder. After the tuning process, we will select a single numeric value for each of these hyperparameters. 
+
+#While boosted tree models are sensitive to the values of hyperparameters, it may be advantageous to tune hyperparameters on any model you decide to use. You can find descriptions for these settings below:
+
+?boost_tree
+
+# Here is the code for the other models, RF and LR
+
+# RF 
+
+randomforest_spec <-
+  rand_forest(mtry = tune(),
+             trees = tune(),
+             min_n = tune()
+             ) %>%
+  set_engine("randomForest") %>%
+  set_mode("classification")
+# 
+# # LR
+# 
+lr_spec <-
+  logistic_reg(penalty = tune(),
+             mixture = tune()
+             ) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+#
+
+```
+
+
+## 1.5 Combine recipes and models to create workflows
+
+```{r}
+### Create list of recipes and models
+recipe_list <-
+  list(mean=data_rec_mean,
+       knn=data_rec_knn)
+
+model_list <-
+  list(XGBoost = xgboost_spec,
+       RandomForest = randomforest_spec,
+       LogisticRegression = lr_spec
+       )
+
+### Ceate model set
+model_set <- workflow_set(preproc = recipe_list, models = model_list, cross = T)
+
+# Let's now also define the resampling method we want to do in our training dataset. We do this because we want to be able to determine the predictive performance of our model from the training data. Here, we will perform 10-fold cross validation.
+set.seed(123)
+data_folds <- vfold_cv(data_train, v = 10, strata = judge)
+
+# Now we will fit models with different hyperparameter settings to find the best model.
+# We will first generate 50 (grid = 50) combinations of the hyperparameters identified above (tune()). 
+# From there, we will fit models based on these parameters, saving the results in the meantime (control = grid_ctrl)
+# We will then calculate every metric to determine how predictive these 50 models are (as defined in all_metrics)
+
+grid_ctrl <- 
+  control_grid(
+    save_pred = TRUE,
+    parallel_over = "everything",
+    save_workflow = TRUE
+  )
+
+# Parallelise
+
+doParallel::registerDoParallel(cores = 6) # change based on the number of available cores on your laptop 
+
+# Generate models
+grid_results_impute <- 
+  model_set %>% 
+  workflow_map(
+    seed = 123,
+    resamples = data_folds,
+    grid = 50,
+    control = grid_ctrl,
+    verbose = TRUE,
+    metrics = metric_set(accuracy, 
+                         roc_auc, 
+                         f_meas, 
+                         mcc, 
+                         sens, 
+                         spec, 
+                         bal_accuracy)
+  )
+
+# Stop parallelising
+doParallel::stopImplicitCluster()
+```
+
+
+## 1.6 Compare models
+
+```{r}
+metrics <- collect_metrics(grid_results_impute) %>%
+  separate(wflow_id, into = c("Recipe", "Model_Type"), sep = "_", remove = F, extra = "merge") %>% # Add new columns Recipe and Model_Type, defined from wflow_id
+  filter(.metric == "f_meas") %>% # Filter only results that measure performance by F1
+  group_by(wflow_id) %>% # Group all models from the same combination of recipe + model together (hyperparameters differ)
+  filter(mean == max(mean, na.rm = T)) %>% # For each recipe + model combination, take best hyperparameter combo
+  group_by(model) %>% # This and following code removes duplicates in case there are duplicate models with the same highest mean 
+  select(-.config) %>%
+  distinct() %>%
+  ungroup() %>%
+  dplyr::mutate(Workflow_Rank =  row_number(-mean), 
+         .metric = str_to_upper(.metric)) # This adds an extra column to rank the models by decreasing means, and then capitalises the metric.
+
+metrics %>%  
+  ggplot(aes(x=Workflow_Rank, y = mean, shape = Recipe, color = model)) +
+    geom_point() +
+    geom_errorbar(aes(ymin = mean-std_err, ymax = mean+std_err)) +
+    theme_minimal()+
+    scale_colour_viridis_d() +
+    labs(title = "Performance Comparison of Workflow Sets", x = "Workflow Rank", y = str_to_upper(chosen_metric), color = "Model Types", shape = "Recipes")
+
+autoplot(
+   grid_results_impute,
+   rank_metric = chosen_metric,
+   metric = chosen_metric,
+   select_best = TRUE) +
+   geom_text(aes(y = mean - 1/5, label = wflow_id), angle = 90, hjust = 1) +
+   lims(y = c(-0.5, 1)) +
+   theme(legend.position = "none")
+
+```
+
+
+## 1.7 Select best model
+
+```{r}
+# Name of best model+recipe (identified from autoplot)
+best_model_id <- "knn_RandomForest"
+
+# Select best hyperparameters of best model
+best_results_parameters <- 
+   grid_results_impute %>% 
+   extract_workflow_set_result(best_model_id) %>% 
+   select_best(metric = "f_meas")
+
+best_results_parameters
+```
+
+
+## 1.8 Evaluate best model on test set
+
+```{r}
+### Now that we have our optimal model, we can finalise our workflow with the settings saved in best_tree.
+final_wf <- 
+   grid_results_impute %>% 
+   extract_workflow(best_model_id) %>% 
+   finalize_workflow(best_results_parameters)
+
+# Now that we have finalised out workflow, we can fit it against our test data
+final_fit <-
+  final_wf %>%
+  last_fit(split = splits, metrics = all_metrics)
+
+# Collect metrics about predictive model, like accuracy, roc-auc, brier class
+final_fit %>%
+  collect_metrics()
+```
+
+
+## 1.9 Visualisations
+# 1.9.1 ROC-AUC curve
+
+```{r}
+# Plot ROC-AUC curve for knn_RandomForest
+xgb_auc <- final_fit %>%
+  collect_predictions() %>% 
+  roc_curve(judge, .pred_0) %>% 
+  dplyr::mutate(model = "knn_RandomForest")
+
+xgb_auc %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+
+# Plot ROC-AUC curve for all models:
+
+# Name of best model+recipes (identified from autoplot)
+wf_ids <- c("knn_RandomForest", "mean_RandomForest", "knn_XGBoost", "mean_XGBoost", "knn_LogisticRegression", "mean_LogisticRegression")
+wf_ids_knn <- c("knn_RandomForest", "knn_XGBoost", "knn_LogisticRegression")
+wf_ids_mean <- c("mean_RandomForest", "mean_XGBoost", "mean_LogisticRegression")
+
+# Create empty dataframe to add our metrics in for each workflow
+df <- data.frame(.threshold=integer(),
+                 specificity=integer(), 
+                 sensitivity=integer(),
+                 model=character(),
+                 stringsAsFactors=FALSE) 
+
+# For each workflow, fit it against test data, extract predictions.
+for (wf in wf_ids_mean) { # change wf_ids to wf_ids_knn or wf_ids_knn
+  auc <- grid_results_impute %>% 
+    extract_workflow(wf) %>% 
+    finalize_workflow(grid_results_impute %>% 
+                        extract_workflow_set_result(wf) %>% 
+                        select_best(metric = "f_meas")) %>%
+    last_fit(split = splits, metrics = all_metrics) %>%
+    collect_predictions() %>% 
+    roc_curve(judge, .pred_0) %>% 
+    dplyr::mutate(model = wf)
+  df <- bind_rows(df, auc)
+}
+
+# Plot predictions on ROC-AUC
+df %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, col = model)) + 
+  geom_path(lwd = 1.5, alpha = 0.8) +
+  geom_abline(lty = 3) + 
+  coord_equal() + 
+  scale_color_viridis_d(option = "plasma", end = .6)
+```
+
+
+# 1.9.2 VIP
+
+```{r}
+# The final_fit object contains a finalized, fitted workflow that you can use for predicting on new data or further understanding the results. 
+
+final_tree <- extract_workflow(final_fit)
+
+# Perhaps we would also like to understand what variables are important in this final model. We can use the vip package to estimate variable importance based on the model’s structure.
+final_tree %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+```
+
+
+# 1.9.3 explain_tidymodels
+
+```{r}
+
+pred <- function(model, newdata)  {
+  return(predict(model, newdata, type="prob")$.pred_1)
+}
+
+explainer <- 
+  explain_tidymodels(
+    final_tree, 
+    data = data_test %>% dplyr::select(-judge), 
+    y = as.numeric(data_test$judge),
+    predict_function = pred,
+    label = best_model_id,
+    type = "classification"
+  )
+
+# Define function to generate Partial dependence profiles
+ggplot_pdp <- function(obj, x) {
+  
+  p <- 
+    as_tibble(obj$agr_profiles) %>%
+    dplyr::mutate(`_label_` = stringr::str_remove(`_label_`, "^[^_]*_")) %>%
+    ggplot(aes(`_x_`, `_yhat_`)) +
+    geom_line(data = as_tibble(obj$cp_profiles),
+              aes(x = {{ x }}, group = `_ids_`),
+              linewidth = 0.5, alpha = 0.05, color = "gray50")
+  
+  num_colors <- n_distinct(obj$agr_profiles$`_label_`)
+  
+  if (num_colors > 1) {
+    p <- p + geom_line(aes(color = `_label_`), linewidth = 1.2, alpha = 0.8)
+  } else {
+    p <- p + geom_line(color = "midnightblue", linewidth = 1.2, alpha = 0.8)
+  }
+  
+  p
+}
+
+pdp_biological_similarity <- model_profile(explainer, N = 500, variables = "Biological Process Similarity")
+pdp_separation_score <- model_profile(explainer, N = 500, variables = "Separation Score")
+pdp_adr <- model_profile(explainer, N = 500, variables = "Adverse Drug Reaction Intersection Degree")
+pdp_moa <- model_profile(explainer, N = 500, variables = "The Similarity of Mode of Action")
+pdp_did <- model_profile(explainer, N = 500, variables = "Disease Intersection Degree")
+
+ggplot_pdp(pdp_biological_similarity, `Biological Process Similarity`)  +
+  labs(x = "Biological Process Similarity", 
+       y = "Judge", 
+       color = NULL)
+ggplot_pdp(pdp_separation_score, `Separation Score`)  +
+  labs(x = "Separation Score", 
+       y = "Judge", 
+       color = NULL)
+ggplot_pdp(pdp_adr, `Adverse Drug Reaction Interaction Degree`)  +
+  labs(x = "Adverse Drug Reaction Interaction Degree", 
+       y = "Judge", 
+       color = NULL)
+ggplot_pdp(pdp_moa, `The Similarity of Mode of Action`)  +
+  labs(x = "The Similarity of Mode of Action", 
+       y = "Judge", 
+       color = NULL)
+ggplot_pdp(pdp_did, `Disease Intersection Degree`)  +
+  labs(x = "Disease Intersection Degree", 
+       y = "Judge", 
+       color = NULL)
+```
+
+
+## Extra: Running a single recipe against a single model ()
+
+```{r}
+# We will now create the workflow, which combines the preprocessed data (recipe) with our defined ML model (engine).
+
+lr_workflow <- 
+  workflow() %>% 
+  add_model(xgboost_spec) %>% 
+  add_recipe(data_rec_mean)
+
+grid_results_impute <- 
+  lr_workflow %>% 
+  tune_grid(resamples = data_folds, # cross-fold validation groupings
+            grid = 50,
+            control = grid_ctrl,
+            metrics = all_metrics
+    )
+
+# Select best hyperparameters of best model
+best_results_parameters <- select_best(grid_results_impute, metric = "f_meas")
+```
